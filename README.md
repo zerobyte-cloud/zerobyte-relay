@@ -3,6 +3,8 @@
 The relay server of ZeroByte: a mailbox for end-to-end encrypted envelopes
 between two paired devices. It implements
 [Relay Protocol v1](https://github.com/zerobyte-cloud/zerobyte-protocol/blob/master/relay-v1.md).
+[Timeline v1](https://github.com/zerobyte-cloud/zerobyte-protocol/blob/v1.2.0/timeline-v1.md),
+one state kept on both devices, runs on it unchanged.
 Devices seal every envelope with keys the relay never receives. The relay files
 envelopes by mailbox, direction and sequence, and the reader deletes them once
 it has collected them.

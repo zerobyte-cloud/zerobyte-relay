@@ -308,7 +308,8 @@ Please don't present a relay you run yourself as `zerobyte.cloud`.
 
 ## About ZeroByte
 
-ZeroByte is an open-source project by Szymon Michalik: the protocol, the relay
-and the SDKs. relay.zerobyte.cloud runs the same code as a hosted service:
+ZeroByte is a project by Szymon Michalik: an open protocol, open-source SDKs
+and this source-available relay. relay.zerobyte.cloud runs the same code as a
+hosted service:
 register an app at [console.zerobyte.cloud](https://console.zerobyte.cloud), or
 run your own relay as described above.

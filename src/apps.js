@@ -20,6 +20,8 @@
 //   read=<minutes>     a fetched envelope the reader has not pruned is deleted
 //                      after, 0 … 1440 (default 1440, a day); 0: the fetch
 //                      itself deletes what it returns
+//   keep=<hours>       any envelope still stored this long after it was
+//                      stored is deleted, read or not, 1 … 8760 (default off)
 //
 // Generate an id with `npm run app-id`.
 
@@ -68,6 +70,9 @@ function profile(id, name, options, source = "RELAY_APPS", status = "active") {
       case "read":
         limits.readMilliseconds =
           value === "0" ? 0 : bounded(id, key, value, 0, 1440, source) * 60_000;
+        break;
+      case "keep":
+        limits.keepMilliseconds = bounded(id, key, value, 1, 8760, source) * 3_600_000;
         break;
       default:
         throw new Error(`${source}: ${id}: unknown option "${key}"`);

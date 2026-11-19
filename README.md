@@ -8,7 +8,8 @@ one state kept on both devices, runs on it unchanged.
 Devices seal every envelope with keys the relay never receives. The relay files
 envelopes by mailbox, direction and sequence, and the reader deletes them once
 it has collected them. What a fetch returned and the reader did not delete, the
-relay deletes a day later.
+relay deletes a day later. An app may also have a storage time, after which
+the relay deletes what nobody collected.
 
 It runs in two places from the same protocol core:
 
@@ -53,6 +54,7 @@ RELAY_APPS=<id>=chat;push=com.example.chat;signal;ice;envelopes=1024;idle=90
 | `envelope=KiB` | 1–1024 | Plaintext per envelope (default 1024) |
 | `idle=days` | 1–365 | Erase a mailbox after this long without a write (default 30) |
 | `read=minutes` | 0–1440 | Delete an envelope this long after a fetch first returned it, if the reader has not pruned it (default 1440, a day). `0`: the fetch itself deletes what it returns |
+| `keep=hours` | 1–8760 | Delete any envelope still stored this long after it was stored, read or not (default off: unread envelopes wait for the reader) |
 
 An entry with no options keeps the Relay Protocol v1 defaults, so existing
 configurations behave as before. A bad option stops the relay at start-up.
@@ -160,8 +162,9 @@ writes to the namespace. See [`src/registry.js`](src/registry.js).
 | Kept | Where | How long |
 |---|---|---|
 | SHA-256 of the mailbox's access token | The mailbox | Until the mailbox is erased |
-| Envelopes not yet deleted, their sequences, total bytes | The mailbox | Until the reader prunes them; once a fetch has returned them, a day at most (`read`); unread, until 30 to 31 days without a write |
+| Envelopes not yet deleted, their sequences, total bytes | The mailbox | Until the reader prunes them; once a fetch has returned them, a day at most (`read`); unread, until the app's storage time ends (`keep`) or 30 to 31 days without a write |
 | The highest sequence fetched, and when its read time ends | The mailbox | Until the mailbox is erased |
+| When envelopes were stored, to the hour | The mailbox | As long as the envelopes |
 | A push registration per direction, sealed (below) | The mailbox | Until it is replaced or deleted, APNs or FCM reports it dead, or the mailbox is erased |
 | Rate-limit counters | Memory only | While the mailbox is in use |
 | Request logs | Nowhere | |
@@ -173,6 +176,17 @@ asks for envelopes after it (the reader says it has it). Fetches less than a
 minute apart share one deadline. With `read=0` the fetch itself deletes what it
 returns, so a response lost on the way is gone for good; use it only when the
 app can ask the writer again.
+
+Without `keep`, an envelope the reader never fetches waits for it as long as
+the mailbox lives. With `keep=hours`, the relay deletes any envelope still
+stored that long after it was stored, read or not. Envelopes stored less than
+an hour apart (or a 24th of the storage time, if shorter) share the time of
+the first, so none stays longer than the storage time. Envelopes stored before
+1.4.0 count from the first request the mailbox gets after it. The relay dates
+every envelope even without `keep`, so turning it on applies to what is
+already waiting; a mailbox learns of a change with its next request, and one
+nobody uses goes at its idle time. A writer learns nothing when its envelopes
+go: use it for apps that can recover, for example by sending their state again.
 
 The Node server prints one line at start and never logs a request. SQLite runs
 with `secure_delete`, so pruned ciphertext is overwritten on disk. The Cloudflare
@@ -273,6 +287,7 @@ an app can keep a quiet mailbox alive without writing to it.
 | One fetch | 16 envelopes | |
 | Idle mailbox | Erased 30 to 31 days after the last write | 1 to 365 days (plus one) |
 | Read time | An envelope a fetch returned is deleted a day later, unless pruned sooner | 0 to 1440 minutes; 0 deletes at the fetch |
+| Storage time | Off: an unread envelope waits for the reader | 1 to 8760 hours after it was stored, read or not |
 | Signal frame | 64 KiB | |
 
 ## Development

@@ -6,8 +6,9 @@
 // they agreed when they paired, and none ever reaches the relay. It stores, per
 // mailbox, the SHA-256 of one bearer token, the envelopes not yet read, and
 // their sequence numbers. An envelope goes when the reader prunes it, and at the
-// latest a day after a fetch first returned it, pruned or not. A mailbox nobody
-// writes to for 30 days erases itself.
+// latest a day after a fetch first returned it, pruned or not. An app may also
+// have a storage time: an envelope still stored that long after it was stored
+// goes, read or not. A mailbox nobody writes to for 30 days erases itself.
 //
 // Optional extensions, enabled per app (src/apps.js):
 //
@@ -56,6 +57,9 @@ export const DEFAULT_LIMITS = Object.freeze({
   // How long an envelope stays after a fetch first returned it, if the reader
   // does not prune it sooner. 0: the fetch itself deletes what it returns.
   readMilliseconds: 24 * 60 * 60 * 1000,
+  // How long any envelope may stay after it was stored, read or not. null: until
+  // it is read, or the mailbox is erased.
+  keepMilliseconds: null,
 });
 /** The defaults, under their original name. */
 export const LIMITS = DEFAULT_LIMITS;
@@ -90,6 +94,10 @@ const DAY = 24 * 60 * 60 * 1000;
 // and a direction keeps at most this many deadlines, so `meta` stays small.
 const READ_MERGE_MILLISECONDS = 60_000;
 const READ_DEADLINES = 32;
+// Envelopes stored within an hour (or a 24th of the app's storage time) share
+// the time of the first, and a direction keeps at most this many such times.
+const HOUR = 60 * 60 * 1000;
+const STORED_DATES = 64;
 
 const HEADERS = {
   "Cache-Control": "no-store",
@@ -315,12 +323,15 @@ export async function handle(request, env) {
  * One mailbox. State, under `ctx.storage`:
  *   meta          { digest, last: { p2c, c2p } (decimal strings), bytes, count: { p2c, c2p },
  *                   idle (ms: erased at), fetched: { p2c, c2p } (highest sequence a fetch
- *                   returned), read: { p2c, c2p: [[through, ms], …] } (read deadlines) }
+ *                   returned), read: { p2c, c2p: [[through, ms], …] } (read deadlines),
+ *                   stored: { p2c, c2p: [[through, ms], …] } (when envelopes were stored),
+ *                   keep (ms or null: the app's storage time, for the alarm) }
  *   e:<dir>:<seq, 20 digits>   Uint8Array envelope
  *   push:<dir>    { iv, data }: the reader's push registration, sealed (push.js)
  *
- * The one alarm is set to whatever falls due first: the idle deadline, or the
- * end of the read time of envelopes a fetch returned and nobody pruned.
+ * The one alarm is set to whatever falls due first: the idle deadline, the end
+ * of the read time of envelopes a fetch returned and nobody pruned, or the end
+ * of the storage time of the oldest envelope.
  *
  * `ctx` provides:
  *   storage       get, put, list, delete, deleteAll, getAlarm, setAlarm, deleteAlarm
@@ -390,6 +401,7 @@ export class Mailbox {
     }
 
     if (!meta || !sameText(meta.digest, tokenDigest)) return reply(401);
+    await this.settle(meta, limits);
     const directionName = place.direction;
 
     switch (kind) {
@@ -442,6 +454,7 @@ export class Mailbox {
   async claim(body, meta, tokenDigest, limits) {
     if (meta) {
       if (!sameText(meta.digest, tokenDigest)) return reply(403);
+      await this.settle(meta, limits);
       // A confirmed claim is a heartbeat: it keeps an idle mailbox alive.
       await this.touch(meta, limits);
       return reply(204);
@@ -456,7 +469,14 @@ export class Mailbox {
     }
     if (!sameText(claimed?.tokenDigest, tokenDigest)) return reply(400);
     // Saved by touch: a fresh mailbox always starts its idle timer.
-    const fresh = { digest: tokenDigest, last: {}, bytes: 0, count: { p2c: 0, c2p: 0 } };
+    const fresh = {
+      digest: tokenDigest,
+      last: {},
+      bytes: 0,
+      count: { p2c: 0, c2p: 0 },
+      stored: { p2c: [], c2p: [] },
+      keep: limits.keepMilliseconds ?? null,
+    };
     await this.touch(fresh, limits);
     return reply(201);
   }
@@ -494,8 +514,9 @@ export class Mailbox {
     meta.bytes += bytes.length;
     meta.count[directionName] = waiting + 1;
     const renewed = this.renew(meta, limits);
+    const first = this.date(meta, directionName, sequence, limits);
     await this.ctx.storage.put({ [`e:${directionName}:${pad(sequence)}`]: bytes, meta });
-    if (renewed) await this.schedule(meta);
+    if (renewed || (first && typeof meta.keep === "number")) await this.schedule(meta);
     for (const socket of this.ctx.sockets(directionName)) {
       try {
         socket.send(sequence.toString());
@@ -578,7 +599,7 @@ export class Mailbox {
     await this.schedule(meta);
   }
 
-  /** Deletes a direction's envelopes through a sequence, and the read deadlines they had. */
+  /** Deletes a direction's envelopes through a sequence, and their read deadlines and dates. */
   async drop(meta, directionName, through) {
     const prefix = `e:${directionName}:`;
     const end = prefix + pad(through + 1n);
@@ -594,8 +615,10 @@ export class Mailbox {
     }
     meta.bytes = Math.max(0, meta.bytes);
     meta.count[directionName] = Math.max(0, waiting - removed);
-    const marks = meta.read?.[directionName];
-    if (marks) meta.read[directionName] = marks.filter(([sequence]) => BigInt(sequence) > through);
+    for (const kind of ["read", "stored"]) {
+      const marks = meta[kind]?.[directionName];
+      if (marks) meta[kind][directionName] = marks.filter(([s]) => BigInt(s) > through);
+    }
   }
 
   async erase() {
@@ -785,6 +808,51 @@ export class Mailbox {
     return true;
   }
 
+  /**
+   * Brings a mailbox in line with its app: records the app's storage time for
+   * the alarm, and dates envelopes stored before mailboxes kept dates from now.
+   */
+  async settle(meta, limits) {
+    const keep = limits.keepMilliseconds ?? null;
+    let changed = (meta.keep ?? null) !== keep;
+    meta.keep = keep;
+    meta.stored ??= {};
+    for (const directionName of Object.keys(DIRECTIONS)) {
+      if (meta.stored[directionName]) continue;
+      const last = meta.last[directionName];
+      const waiting = last ? await this.waiting(meta, directionName) : 0;
+      meta.stored[directionName] = waiting ? [[last, this.now()]] : [];
+      changed = true;
+    }
+    if (!changed) return;
+    if (typeof meta.idle !== "number") {
+      // A mailbox from before `idle` kept its idle deadline only in the alarm.
+      meta.idle = (await this.ctx.storage.getAlarm()) ?? this.now() + limits.idleMilliseconds + DAY;
+    }
+    await this.ctx.storage.put("meta", meta);
+    await this.schedule(meta);
+  }
+
+  /**
+   * Dates an envelope just stored. Envelopes stored within the window share the
+   * first one's time, so none stays past its storage time. True when it is the
+   * oldest dated envelope of its direction.
+   */
+  date(meta, directionName, sequence, limits) {
+    const marks = ((meta.stored ??= {})[directionName] ??= []);
+    const now = this.now();
+    const keep = limits.keepMilliseconds;
+    const latest = marks.at(-1);
+    if (latest && now - latest[1] < (keep ? Math.min(HOUR, keep / 24) : HOUR)) {
+      latest[0] = sequence.toString();
+      return false;
+    }
+    marks.push([sequence.toString(), now]);
+    // Past the cap the two oldest merge, keeping the earlier time.
+    if (marks.length > STORED_DATES) marks.splice(0, 2, [marks[1][0], marks[0][1]]);
+    return marks.length === 1;
+  }
+
   /** Restarts the idle timer of a mailbox that has nothing else to save. */
   async touch(meta, limits = DEFAULT_LIMITS) {
     if (!this.renew(meta, limits)) return;
@@ -792,19 +860,25 @@ export class Mailbox {
     await this.schedule(meta);
   }
 
-  /** Sets the one alarm to what falls due first: the idle or a read deadline. */
+  /** Sets the one alarm to what falls due first: the idle, a read or a storage deadline. */
   async schedule(meta, force = false) {
     let at = meta.idle;
     for (const marks of Object.values(meta.read ?? {})) {
       for (const [, due] of marks) if (due < at) at = due;
+    }
+    if (typeof meta.keep === "number") {
+      // Dates only grow along a direction: its first is its oldest envelope's.
+      for (const marks of Object.values(meta.stored ?? {})) {
+        if (marks.length && marks[0][1] + meta.keep < at) at = marks[0][1] + meta.keep;
+      }
     }
     if (!force && (await this.ctx.storage.getAlarm()) === at) return;
     await this.ctx.storage.setAlarm(at);
   }
 
   /**
-   * Erases an idle mailbox; otherwise deletes the envelopes whose read time is
-   * over and sets the alarm for the next deadline.
+   * Erases an idle mailbox; otherwise deletes the envelopes whose read time or
+   * storage time is over and sets the alarm for the next deadline.
    */
   async alarm() {
     const meta = await this.meta();
@@ -814,12 +888,17 @@ export class Mailbox {
       await this.erase();
       return;
     }
+    const keep = typeof meta.keep === "number" ? meta.keep : null;
     let changed = false;
     for (const directionName of Object.keys(DIRECTIONS)) {
-      const due = (meta.read?.[directionName] ?? []).filter(([, at]) => at <= now);
-      if (due.length === 0) continue;
       let through = 0n;
-      for (const [sequence] of due) if (BigInt(sequence) > through) through = BigInt(sequence);
+      for (const [sequence, due] of meta.read?.[directionName] ?? []) {
+        if (due <= now && BigInt(sequence) > through) through = BigInt(sequence);
+      }
+      for (const [sequence, at] of keep === null ? [] : (meta.stored?.[directionName] ?? [])) {
+        if (at + keep <= now && BigInt(sequence) > through) through = BigInt(sequence);
+      }
+      if (through === 0n) continue;
       await this.drop(meta, directionName, through);
       changed = true;
     }

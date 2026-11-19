@@ -17,6 +17,9 @@
 //   mailbox=<MiB>      mailbox size, 1 … 256 (default 32)
 //   envelope=<KiB>     largest plaintext, 1 … 1024 (default 1024)
 //   idle=<days>        idle mailbox erased after, 1 … 365 (default 30)
+//   read=<minutes>     a fetched envelope the reader has not pruned is deleted
+//                      after, 0 … 1440 (default 1440, a day); 0: the fetch
+//                      itself deletes what it returns
 //
 // Generate an id with `npm run app-id`.
 
@@ -61,6 +64,10 @@ function profile(id, name, options, source = "RELAY_APPS", status = "active") {
         break;
       case "idle":
         limits.idleMilliseconds = bounded(id, key, value, 1, 365, source) * 24 * 60 * 60 * 1000;
+        break;
+      case "read":
+        limits.readMilliseconds =
+          value === "0" ? 0 : bounded(id, key, value, 0, 1440, source) * 60_000;
         break;
       default:
         throw new Error(`${source}: ${id}: unknown option "${key}"`);

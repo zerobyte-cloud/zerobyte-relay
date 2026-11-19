@@ -246,6 +246,10 @@ test("Erasing removes everything, including the claim, and idle mailboxes erase 
   assert.equal((await call("/p2c")).status, 401);
 
   await claim(OTHER);
+  // The alarm also serves read deadlines: before the idle time it erases nothing.
+  await box.alarm();
+  assert.equal(box.ctx.storage.map.size, 1);
+  box.now = () => Date.now() + LIMITS.idleMilliseconds + 2 * 86_400_000;
   await box.alarm();
   assert.equal(box.ctx.storage.map.size, 0);
 });

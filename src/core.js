@@ -5,7 +5,9 @@
 // It cannot open them: every key is derived on the devices from the link key
 // they agreed when they paired, and none ever reaches the relay. It stores, per
 // mailbox, the SHA-256 of one bearer token, the envelopes not yet read, and
-// their sequence numbers. A mailbox nobody writes to for 30 days erases itself.
+// their sequence numbers. An envelope goes when the reader prunes it, and at the
+// latest a day after a fetch first returned it, pruned or not. A mailbox nobody
+// writes to for 30 days erases itself.
 //
 // Optional extensions, enabled per app (src/apps.js):
 //
@@ -28,7 +30,7 @@
 //   PUT    /v1/<app>/mailbox/<id>                     claim (first bearer wins) or confirm
 //   DELETE /v1/<app>/mailbox/<id>                     erase everything
 //   PUT    /v1/<app>/mailbox/<id>/<p2c|c2p>/<seq>     store one envelope [X-Relay-Notify]
-//   GET    /v1/<app>/mailbox/<id>/<p2c|c2p>?after=&limit=   envelopes after a sequence
+//   GET    /v1/<app>/mailbox/<id>/<p2c|c2p>?after=&limit=   envelopes after a sequence (read)
 //   HEAD   /v1/<app>/mailbox/<id>/<p2c|c2p>           X-Relay-Last only
 //   DELETE /v1/<app>/mailbox/<id>/<p2c|c2p>?through=  drop what the reader has read
 //   GET    /v1/<app>/mailbox/<id>/<p2c|c2p>/watch     WebSocket: sequence numbers only
@@ -51,6 +53,9 @@ export const DEFAULT_LIMITS = Object.freeze({
   envelopesPerDirection: 64,
   fetchLimit: 16,
   idleMilliseconds: 30 * 24 * 60 * 60 * 1000,
+  // How long an envelope stays after a fetch first returned it, if the reader
+  // does not prune it sooner. 0: the fetch itself deletes what it returns.
+  readMilliseconds: 24 * 60 * 60 * 1000,
 });
 /** The defaults, under their original name. */
 export const LIMITS = DEFAULT_LIMITS;
@@ -81,6 +86,10 @@ const MAX_SEQUENCE = 2n ** 64n - 1n;
 // envelopes in memory however large the app's quota is.
 const PAGE = 16;
 const DAY = 24 * 60 * 60 * 1000;
+// Fetches this close together (one run of a reader) share one read deadline,
+// and a direction keeps at most this many deadlines, so `meta` stays small.
+const READ_MERGE_MILLISECONDS = 60_000;
+const READ_DEADLINES = 32;
 
 const HEADERS = {
   "Cache-Control": "no-store",
@@ -304,9 +313,14 @@ export async function handle(request, env) {
 
 /**
  * One mailbox. State, under `ctx.storage`:
- *   meta          { digest, last: { p2c, c2p } (decimal strings), bytes, count: { p2c, c2p } }
+ *   meta          { digest, last: { p2c, c2p } (decimal strings), bytes, count: { p2c, c2p },
+ *                   idle (ms: erased at), fetched: { p2c, c2p } (highest sequence a fetch
+ *                   returned), read: { p2c, c2p: [[through, ms], …] } (read deadlines) }
  *   e:<dir>:<seq, 20 digits>   Uint8Array envelope
  *   push:<dir>    { iv, data }: the reader's push registration, sealed (push.js)
+ *
+ * The one alarm is set to whatever falls due first: the idle deadline, or the
+ * end of the read time of envelopes a fetch returned and nobody pruned.
  *
  * `ctx` provides:
  *   storage       get, put, list, delete, deleteAll, getAlarm, setAlarm, deleteAlarm
@@ -387,7 +401,7 @@ export class Mailbox {
         if (request.method !== "GET") return reply(405, null, { Allow: "GET" });
         return this.ice();
       case "push":
-        if (request.method === "PUT") return this.register(directionName, sealed, limits);
+        if (request.method === "PUT") return this.register(directionName, sealed, meta, limits);
         if (request.method === "DELETE") return this.unregister(directionName);
         return reply(405, null, { Allow: "PUT, DELETE" });
       case "put": {
@@ -429,7 +443,7 @@ export class Mailbox {
     if (meta) {
       if (!sameText(meta.digest, tokenDigest)) return reply(403);
       // A confirmed claim is a heartbeat: it keeps an idle mailbox alive.
-      await this.touch(limits);
+      await this.touch(meta, limits);
       return reply(204);
     }
     // A claim names the digest of its own token, so a mistyped client never
@@ -441,13 +455,9 @@ export class Mailbox {
       return reply(400);
     }
     if (!sameText(claimed?.tokenDigest, tokenDigest)) return reply(400);
-    await this.ctx.storage.put("meta", {
-      digest: tokenDigest,
-      last: {},
-      bytes: 0,
-      count: { p2c: 0, c2p: 0 },
-    });
-    await this.touch(limits);
+    // Saved by touch: a fresh mailbox always starts its idle timer.
+    const fresh = { digest: tokenDigest, last: {}, bytes: 0, count: { p2c: 0, c2p: 0 } };
+    await this.touch(fresh, limits);
     return reply(201);
   }
 
@@ -483,8 +493,9 @@ export class Mailbox {
     meta.last[directionName] = sequence.toString();
     meta.bytes += bytes.length;
     meta.count[directionName] = waiting + 1;
+    const renewed = this.renew(meta, limits);
     await this.ctx.storage.put({ [`e:${directionName}:${pad(sequence)}`]: bytes, meta });
-    await this.touch(limits);
+    if (renewed) await this.schedule(meta);
     for (const socket of this.ctx.sockets(directionName)) {
       try {
         socket.send(sequence.toString());
@@ -508,17 +519,67 @@ export class Mailbox {
       start: prefix + pad(from + 1n),
       limit: limit + 1,
     });
-    const envelopes = [...page.values()].slice(0, limit).map((v) => new Uint8Array(v));
-    return reply(200, joinEnvelopes(envelopes), {
+    const entries = [...page].slice(0, limit);
+    const response = reply(200, joinEnvelopes(entries.map(([, v]) => new Uint8Array(v))), {
       "Content-Type": "application/octet-stream",
       "X-Relay-More": page.size > limit ? "1" : "0",
       ...this.lastHeader(meta, directionName),
     });
+    // The reader now has what this fetch returns, and says it has everything
+    // through `after`. Never past the last envelope stored: a later one is unread.
+    const returned = entries.length ? BigInt(entries.at(-1)[0].slice(prefix.length)) : 0n;
+    const last = BigInt(meta.last[directionName] ?? "0");
+    const read = from > returned ? from : returned;
+    await this.markRead(meta, directionName, read < last ? read : last, limits);
+    return response;
   }
 
   async prune(url, meta, directionName) {
     const through = parseSequence(url.searchParams.get("through") ?? "");
     if (through === null) return reply(400);
+    await this.drop(meta, directionName, through);
+    await this.ctx.storage.put("meta", meta);
+    return reply(204);
+  }
+
+  /**
+   * A fetch returned everything through `through`. The first fetch to do so
+   * starts those envelopes' read time: they go when it ends unless the reader
+   * prunes them sooner, or at once when the app's read time is 0.
+   */
+  async markRead(meta, directionName, through, limits) {
+    meta.fetched ??= {};
+    if (through <= BigInt(meta.fetched[directionName] ?? "0")) return;
+    meta.fetched[directionName] = through.toString();
+    if (limits.readMilliseconds === 0) {
+      await this.drop(meta, directionName, through);
+      await this.ctx.storage.put("meta", meta);
+      return;
+    }
+    if (typeof meta.idle !== "number") {
+      // A mailbox from before `idle` kept its idle deadline only in the alarm.
+      meta.idle = (await this.ctx.storage.getAlarm()) ?? this.now() + limits.idleMilliseconds + DAY;
+    }
+    const due = this.now() + limits.readMilliseconds;
+    meta.read ??= {};
+    const marks = (meta.read[directionName] ??= []);
+    const latest = marks.at(-1);
+    const merge = Math.min(READ_MERGE_MILLISECONDS, limits.readMilliseconds / 60);
+    if (latest && Math.abs(due - latest[1]) < merge) {
+      // One run of a reader: its fetches share the earlier deadline.
+      latest[0] = through.toString();
+      latest[1] = Math.min(latest[1], due);
+    } else {
+      marks.push([through.toString(), due]);
+      // Past the cap the two oldest merge, keeping the earlier deadline.
+      if (marks.length > READ_DEADLINES) marks.splice(0, 2, [marks[1][0], marks[0][1]]);
+    }
+    await this.ctx.storage.put("meta", meta);
+    await this.schedule(meta);
+  }
+
+  /** Deletes a direction's envelopes through a sequence, and the read deadlines they had. */
+  async drop(meta, directionName, through) {
     const prefix = `e:${directionName}:`;
     const end = prefix + pad(through + 1n);
     const waiting = await this.waiting(meta, directionName);
@@ -533,8 +594,8 @@ export class Mailbox {
     }
     meta.bytes = Math.max(0, meta.bytes);
     meta.count[directionName] = Math.max(0, waiting - removed);
-    await this.ctx.storage.put("meta", meta);
-    return reply(204);
+    const marks = meta.read?.[directionName];
+    if (marks) meta.read[directionName] = marks.filter(([sequence]) => BigInt(sequence) > through);
   }
 
   async erase() {
@@ -577,11 +638,11 @@ export class Mailbox {
 
   // ---- push ---------------------------------------------------------------
 
-  async register(directionName, sealed, limits) {
+  async register(directionName, sealed, meta, limits) {
     const wait = this.rate("register");
     if (wait) return limited(wait);
     await this.ctx.storage.put(`push:${directionName}`, sealed);
-    await this.touch(limits);
+    await this.touch(meta, limits);
     return reply(204);
   }
 
@@ -709,20 +770,60 @@ export class Mailbox {
     }
   }
 
+  // ---- idle and read deadlines --------------------------------------------
+
   /**
-   * Restarts the idle timer. The alarm is set a day past the idle time and
-   * moved only once it falls short, so most writes cost no alarm write: a
+   * Restarts the idle timer. The deadline is set a day past the idle time and
+   * moved only once it falls short, so most writes cost no extra write: a
    * mailbox is erased between `idle` and `idle` plus one day after its last
-   * write or claim.
+   * write or claim. Returns whether `meta.idle` moved.
    */
-  async touch(limits = DEFAULT_LIMITS) {
+  renew(meta, limits = DEFAULT_LIMITS) {
     const due = this.now() + limits.idleMilliseconds;
-    const current = await this.ctx.storage.getAlarm();
-    if (current !== null && current >= due) return;
-    await this.ctx.storage.setAlarm(due + DAY);
+    if (typeof meta.idle === "number" && meta.idle >= due) return false;
+    meta.idle = due + DAY;
+    return true;
   }
 
+  /** Restarts the idle timer of a mailbox that has nothing else to save. */
+  async touch(meta, limits = DEFAULT_LIMITS) {
+    if (!this.renew(meta, limits)) return;
+    await this.ctx.storage.put("meta", meta);
+    await this.schedule(meta);
+  }
+
+  /** Sets the one alarm to what falls due first: the idle or a read deadline. */
+  async schedule(meta, force = false) {
+    let at = meta.idle;
+    for (const marks of Object.values(meta.read ?? {})) {
+      for (const [, due] of marks) if (due < at) at = due;
+    }
+    if (!force && (await this.ctx.storage.getAlarm()) === at) return;
+    await this.ctx.storage.setAlarm(at);
+  }
+
+  /**
+   * Erases an idle mailbox; otherwise deletes the envelopes whose read time is
+   * over and sets the alarm for the next deadline.
+   */
   async alarm() {
-    await this.erase();
+    const meta = await this.meta();
+    const now = this.now();
+    // A mailbox from before `idle` set its alarm only for the idle deadline.
+    if (!meta || typeof meta.idle !== "number" || meta.idle <= now) {
+      await this.erase();
+      return;
+    }
+    let changed = false;
+    for (const directionName of Object.keys(DIRECTIONS)) {
+      const due = (meta.read?.[directionName] ?? []).filter(([, at]) => at <= now);
+      if (due.length === 0) continue;
+      let through = 0n;
+      for (const [sequence] of due) if (BigInt(sequence) > through) through = BigInt(sequence);
+      await this.drop(meta, directionName, through);
+      changed = true;
+    }
+    if (changed) await this.ctx.storage.put("meta", meta);
+    await this.schedule(meta, true);
   }
 }

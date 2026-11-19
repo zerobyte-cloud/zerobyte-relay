@@ -7,7 +7,8 @@ between two paired devices. It implements
 one state kept on both devices, runs on it unchanged.
 Devices seal every envelope with keys the relay never receives. The relay files
 envelopes by mailbox, direction and sequence, and the reader deletes them once
-it has collected them.
+it has collected them. What a fetch returned and the reader did not delete, the
+relay deletes a day later.
 
 It runs in two places from the same protocol core:
 
@@ -51,6 +52,7 @@ RELAY_APPS=<id>=chat;push=com.example.chat;signal;ice;envelopes=1024;idle=90
 | `mailbox=MiB` | 1–256 | Bytes waiting per mailbox (default 32) |
 | `envelope=KiB` | 1–1024 | Plaintext per envelope (default 1024) |
 | `idle=days` | 1–365 | Erase a mailbox after this long without a write (default 30) |
+| `read=minutes` | 0–1440 | Delete an envelope this long after a fetch first returned it, if the reader has not pruned it (default 1440, a day). `0`: the fetch itself deletes what it returns |
 
 An entry with no options keeps the Relay Protocol v1 defaults, so existing
 configurations behave as before. A bad option stops the relay at start-up.
@@ -158,10 +160,19 @@ writes to the namespace. See [`src/registry.js`](src/registry.js).
 | Kept | Where | How long |
 |---|---|---|
 | SHA-256 of the mailbox's access token | The mailbox | Until the mailbox is erased |
-| Unread envelopes, their sequences, total bytes | The mailbox | Until the reader prunes them, or 30 to 31 days without a write |
+| Envelopes not yet deleted, their sequences, total bytes | The mailbox | Until the reader prunes them; once a fetch has returned them, a day at most (`read`); unread, until 30 to 31 days without a write |
+| The highest sequence fetched, and when its read time ends | The mailbox | Until the mailbox is erased |
 | A push registration per direction, sealed (below) | The mailbox | Until it is replaced or deleted, APNs or FCM reports it dead, or the mailbox is erased |
 | Rate-limit counters | Memory only | While the mailbox is in use |
 | Request logs | Nowhere | |
+
+The SDKs prune right after they read, so envelopes normally go within seconds
+of reaching the other device. The read time catches a reader that never came
+back to prune: it starts with the first fetch that returns an envelope, or that
+asks for envelopes after it (the reader says it has it). Fetches less than a
+minute apart share one deadline. With `read=0` the fetch itself deletes what it
+returns, so a response lost on the way is gone for good; use it only when the
+app can ask the writer again.
 
 The Node server prints one line at start and never logs a request. SQLite runs
 with `secure_delete`, so pruned ciphertext is overwritten on disk. The Cloudflare
@@ -261,6 +272,7 @@ an app can keep a quiet mailbox alive without writing to it.
 | Mailbox | 32 MiB, 64 envelopes per direction | 1 to 256 MiB, 16 to 4096 envelopes |
 | One fetch | 16 envelopes | |
 | Idle mailbox | Erased 30 to 31 days after the last write | 1 to 365 days (plus one) |
+| Read time | An envelope a fetch returned is deleted a day later, unless pruned sooner | 0 to 1440 minutes; 0 deletes at the fetch |
 | Signal frame | 64 KiB | |
 
 ## Development
